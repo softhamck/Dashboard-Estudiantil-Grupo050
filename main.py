@@ -1,64 +1,87 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-import re
+import streamlit as st   # interfaz web interactiva
+import pandas as pd      # manejo y análisis de datos tabulares
+import numpy as np       # operaciones numéricas y manejo de NaN
+import matplotlib.pyplot as plt   # creación de gráficos
+from pathlib import Path  # manejo de rutas de archivos
+import re                 # expresiones regulares para limpiar texto
 
-# === Configuración general ===
+
+# CONFIGURACIÓN GENERAL
+
+# Ajusta el título de la pestaña y usa diseño ancho
 st.set_page_config(page_title="Dashboard Estudiantil – Grupo 050", layout="wide")
 
-# --- Tema oscuro global para matplotlib ---
+# Activa el tema oscuro en TODAS las gráficas de Matplotlib
 plt.style.use("dark_background")
 
-# === Utilidades de carga ===
+# UTILIDADES DE CARGA
 def _safe_read_excel(file_or_path):
+    """Lee un Excel con openpyxl y muestra un error en la UI si falla."""
     try:
         return pd.read_excel(file_or_path, engine="openpyxl")
     except Exception as e:
         st.error(f"No se pudo leer el archivo de Excel: {e}")
         raise
 
-@st.cache_data
+@st.cache_data  # Cachea el dataframe para no recargar el archivo en cada interacción
 def load_data(file_or_path) -> pd.DataFrame:
     df = _safe_read_excel(file_or_path)
     return df.copy()
 
-# === Normalización / limpieza ===
+# NORMALIZACIÓN / LIMPIEZA
 def _normalize_signs(txt: str) -> str:
+    """
+    Unifica símbolos de + y - (incluye variantes Unicode) y normaliza mayúsculas/espacios.
+    Ej: 'o +', 'O＋', 'o  positivo' -> 'O +' (luego se compacta).
+    """
     if txt is None or pd.isna(txt):
         return np.nan
     s = str(txt).strip().upper()
+    # Normaliza signos unicode a ASCII
     s = (s.replace("＋", "+").replace("﹢", "+")
            .replace("−", "-").replace("–", "-").replace("—", "-").replace("﹣", "-"))
+    # Colapsa espacios múltiples
     s = re.sub(r"\s+", " ", s)
     return s
 
 def _normalize_rh_value(raw) -> str:
+    """
+    Devuelve RH en formato estándar {A,B,AB,O}{+,-}.
+    Acepta variantes: 'o +', 'a positivo', 'AB-', 'tipo o positivo', etc.
+    Por defecto, si no trae signo, se asume '+'.
+    """
     if raw is None or pd.isna(raw):
         return np.nan
+
     s = _normalize_signs(raw)
-    s = re.sub(r"[.,;:_]", "", s).strip()
-    s = re.sub(r"\bPOS(ITIVO)?\b", "+", s)
-    s = re.sub(r"\bNEG(ATIVO)?\b", "-", s)
-    s = re.sub(r"\b(RH|TIPO)\b", "", s).strip()
-    s = s.replace(" ", "").replace("0", "O")
+    s = re.sub(r"[.,;:_]", "", s).strip()       # Quita signos sueltos
+    s = re.sub(r"\bPOS(ITIVO)?\b", "+", s)      # POSITIVO -> +
+    s = re.sub(r"\bNEG(ATIVO)?\b", "-", s)      # NEGATIVO -> -
+    s = re.sub(r"\b(RH|TIPO)\b", "", s).strip() # Quita palabras RH/TIPO
+    s = s.replace(" ", "").replace("0", "O")    # '0' (cero) -> 'O' (letra)
+
+    # Corrige orden '+O' -> 'O+'
     if re.fullmatch(r"[+\-](A|B|AB|O)", s):
         s = s[1:] + s[0]
+
+    # Valida patrón final
     m = re.fullmatch(r"(AB|A|B|O)([+\-]?)", s)
     if not m:
         return np.nan
+
     grupo, signo = m.groups()
-    if signo == "":
+    if signo == "":  # Si no hay signo, asumimos '+'
         signo = "+"
     return f"{grupo}{signo}"
 
 def normalize_rh_column(df: pd.DataFrame, col: str = "RH") -> pd.DataFrame:
+    """Aplica la normalización de RH sobre la columna indicada (si existe)."""
     if col in df:
         df[col] = df[col].apply(_normalize_rh_value)
     return df
 
 def tidy_text_series(s: pd.Series) -> pd.Series:
+    """Limpia textos: strip, colapsa espacios y aplica Title Case (solo dtype object)."""
     if s.dtype == "O":
         out = s.astype(str).str.strip()
         out = out.str.replace(r"\s+", " ", regex=True)
@@ -67,13 +90,16 @@ def tidy_text_series(s: pd.Series) -> pd.Series:
     return s
 
 def sanitize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Limpia columnas comunes (nombres, barrio, color de cabello) si existen."""
     for col in ["Nombre_Estudiante", "Apellido_Estudiante", "Barrio_Residencia", "Color_Cabello"]:
         if col in df:
             df[col] = tidy_text_series(df[col])
     return df
 
-# === Enriquecimiento numérico ===
+
+# CALCULO EDAD
 def compute_age(fecha_nac):
+    """Convierte la fecha de nacimiento a edad (años completos)."""
     if pd.isna(fecha_nac):
         return np.nan
     fn = pd.to_datetime(fecha_nac, errors="coerce")
@@ -83,19 +109,26 @@ def compute_age(fecha_nac):
     years = hoy.year - fn.year - ((hoy.month, hoy.day) < (fn.month, fn.day))
     return int(years)
 
+# CREACIÓN COLUMNAS DE ESTATURA EN METROS Y CENTÍMETROS
 def ensure_estatura_cm(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Crea columnas Estatura_cm y Estatura_m según unidad detectada:
+    - Si el promedio < 3, la estatura está en metros.
+    - Si no, está en centímetros.
+    """
     if "Estatura" not in df:
         return df
     est = pd.to_numeric(df["Estatura"], errors="coerce")
-    if est.mean(skipna=True) < 3.0:
+    if est.mean(skipna=True) < 3.0:   # Parece estar en metros
         df["Estatura_cm"] = est * 100.0
         df["Estatura_m"] = est
-    else:
+    else:                             # Parece estar en centímetros
         df["Estatura_cm"] = est
         df["Estatura_m"] = est / 100.0
     return df
 
 def clasifica_imc(imc):
+    """Devuelve categoría OMS a partir del IMC numérico."""
     if pd.isna(imc):
         return np.nan
     if imc < 18.5:
@@ -111,29 +144,38 @@ def clasifica_imc(imc):
     else:
         return "Obesidad grado 3"
 
-# === Helper de filtros tolerantes ===
+
+# HELPER: FILTROS
 def optional_isin(series: pd.Series, selected):
-    """Si selected está vacío/None -> no filtra. Si tiene valores -> aplica isin."""
+    """
+    Si `selected` está vacío/None => no filtra (devuelve True para todas las filas).
+    Si tiene valores => aplica series.isin(selected).
+    """
     if selected is None or len(selected) == 0:
         return pd.Series(True, index=series.index)
     return series.isin(selected)
 
-# === Carga automática del archivo local ===
+
+# CARGA DEL ARCHIVO LOCAL
+# Busca el Excel con el nombre esperado en la misma carpeta del script
 data_source = Path(__file__).with_name("ListadoDeEstudiantesGrupo_050.xlsx")
 if not data_source.exists():
     st.error("❌ No se encontró el archivo 'ListadoDeEstudiantesGrupo_050.xlsx' en la carpeta del proyecto.")
     st.stop()
 
+# Lee datos y normaliza/limpia campos
 df = load_data(data_source)
 df = normalize_rh_column(df, col="RH")
 df = sanitize_common_columns(df)
 
+# Crea una columna de nombre completo para filtrar por persona
 df["Nombre_Completo"] = (
     df.get("Nombre_Estudiante", "").astype(str).str.upper().str.strip()
     + " "
     + df.get("Apellido_Estudiante", "").astype(str).str.upper().str.strip()
 )
 
+# Deriva Edad, asegura estatura en cm/m, calcula IMC y clasificación
 df["Edad"] = df["Fecha_Nacimiento"].apply(compute_age) if "Fecha_Nacimiento" in df else np.nan
 df = ensure_estatura_cm(df)
 est_m = pd.to_numeric(df.get("Estatura_m", np.nan), errors="coerce").replace(0, np.nan)
@@ -141,10 +183,12 @@ peso = pd.to_numeric(df.get("Peso", np.nan), errors="coerce")
 df["IMC"] = peso / (est_m ** 2)
 df["Clasificación_IMC"] = df["IMC"].apply(clasifica_imc)
 
-# === Filtros ===
+
+# SIDEBAR: FILTROS DE USO
 with st.sidebar:
     st.markdown("### ⚙️ Filtros")
 
+    # Selector de integrante
     integrantes_grupo = [
         "TODOS",
         "ANDREA MUÑOZ CANO",
@@ -154,6 +198,7 @@ with st.sidebar:
     ]
     integrante_sel = st.selectbox("Integrante del grupo a exponer", integrantes_grupo, index=0)
 
+    # Multiselects
     rh_vals = sorted(df["RH"].dropna().unique()) if "RH" in df else []
     rh_sel = st.multiselect("Tipo de Sangre (RH)", rh_vals, default=rh_vals)
 
@@ -163,6 +208,7 @@ with st.sidebar:
     bar_vals = sorted(df["Barrio_Residencia"].dropna().unique()) if "Barrio_Residencia" in df else []
     bar_sel = st.multiselect("Barrio de Residencia", bar_vals, default=bar_vals)
 
+    # Sliders
     edades = df["Edad"].dropna()
     min_edad = int(edades.min()) if len(edades) else 0
     max_edad = int(edades.max()) if len(edades) else 0
@@ -173,12 +219,15 @@ with st.sidebar:
     max_est = int(ests.max()) if len(ests) else 0
     r_est = st.slider("Rango de Estatura (cm)", min_value=min_est, max_value=max_est, value=(min_est, max_est))
 
-# === Aplicar filtros===
+
+# APLICAR FILTROS A LOS DATOS
 mask = pd.Series(True, index=df.index)
 
+# Si se elige una persona específica, filtra por su nombre completo
 if integrante_sel != "TODOS":
     mask &= (df["Nombre_Completo"] == integrante_sel.upper())
 
+# Multiselects
 if "RH" in df:
     mask &= optional_isin(df["RH"], rh_sel)
 if "Color_Cabello" in df:
@@ -186,28 +235,33 @@ if "Color_Cabello" in df:
 if "Barrio_Residencia" in df:
     mask &= optional_isin(df["Barrio_Residencia"], bar_sel)
 
+# Sliders: siempre restringen por rango elegido
 mask &= df["Edad"].between(r_edad[0], r_edad[1])
 mask &= df["Estatura_cm"].between(r_est[0], r_est[1])
 
+# Subconjunto final a visualizar
 dff = df.loc[mask].copy()
 
-# === Título  ===
+
+# TÍTULO Y TABLA BASE
 if integrante_sel == "TODOS":
     st.markdown("## 🎓 Dashboard Estudiantil – **Grupo 050**")
 else:
+    # Muestra nombre y código (si existe)
     nombre_mostrar = integrante_sel.title()
     codigo_mostrar = str(dff["Código"].iloc[0]) if not dff.empty and "Código" in dff else ""
     st.markdown(f"## 🎓 Dashboard Estudiantil – **{nombre_mostrar}** | Código: **{codigo_mostrar}**")
 
-# === Tabla base ===
+# Si tras filtrar no hay datos, avisa y corta el flujo de gráficos/KPIs
 if dff.empty:
     st.warning("No hay datos para mostrar con los filtros actuales.")
     st.stop()
 
+# Muestra la tabla (ya filtrada) en pantalla completa
 st.dataframe(dff, use_container_width=True)
 st.markdown("---")
 
-# === KPIs ===
+# INDICADORES (KPIs)
 kpi_cols = st.columns(5)
 kpi_cols[0].metric("Total Estudiantes", int(len(dff)))
 kpi_cols[1].metric("Edad Promedio", f"{dff['Edad'].mean():.1f} años" if len(dff) else "—")
@@ -217,7 +271,7 @@ kpi_cols[4].metric("IMC Promedio", f"{dff['IMC'].mean():.1f}" if len(dff) else "
 
 st.markdown("---")
 
-# === Gráficos ===
+# GRÁFICOS (MATPLOTLIB)
 c1, c2 = st.columns(2)
 with c1:
     st.markdown("#### Distribución por Edad")
@@ -274,7 +328,8 @@ with c6:
 
 st.markdown("---")
 
-# === Top 5 ===
+
+# TOP 5 (DESCARGABLES)
 top5_altos = dff.sort_values("Estatura_cm", ascending=False).head(5)
 top5_pesados = dff.sort_values("Peso", ascending=False).head(5)
 
@@ -283,18 +338,26 @@ c7, c8 = st.columns(2)
 with c7:
     st.write("**Mayor Estatura**")
     st.dataframe(top5_altos[["Código","Nombre_Estudiante","Apellido_Estudiante","Estatura_cm"]])
-    st.download_button("Descargar CSV", data=top5_altos.to_csv(index=False).encode("utf-8"), file_name="top5_estatura.csv")
+    st.download_button(
+        "Descargar CSV",
+        data=top5_altos.to_csv(index=False).encode("utf-8"),
+        file_name="top5_estatura.csv"
+    )
 
 with c8:
     st.write("**Mayor Peso**")
     st.dataframe(top5_pesados[["Código","Nombre_Estudiante","Apellido_Estudiante","Peso"]])
-    st.download_button("Descargar CSV", data=top5_pesados.to_csv(index=False).encode("utf-8"), file_name="top5_peso.csv")
+    st.download_button(
+        "Descargar CSV",
+        data=top5_pesados.to_csv(index=False).encode("utf-8"),
+        file_name="top5_peso.csv"
+    )
 
-# === Resumen ===
+# RESUMEN ESTADÍSTICO
 st.markdown("### 📈 Resumen Estadístico")
 r1, r2, r3 = st.columns(3)
 r1.dataframe(dff["Estatura_cm"].describe().to_frame())
 r2.dataframe(dff["Peso"].describe().to_frame())
 r3.dataframe(dff["IMC"].describe().to_frame())
 
-st.caption("Clasificación IMC basada en rangos estándar (OMS).")
+st.caption("Elaborado por: Andrea Muñoz, Camilo Fuentes, Tomás Madrid & Juliana Manco")
